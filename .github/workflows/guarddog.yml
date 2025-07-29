@@ -1,0 +1,145 @@
+name: GuardDog Security Scan
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  guarddog-scan:
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+    name: Scan dependencies for malicious packages
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install GuardDog
+        run: pip install guarddog
+
+      - name: Create logs directory
+        run: mkdir -p logs
+
+      # Scan npm dependencies
+      - name: Scan npm packages (SARIF output)
+        if: hashFiles('package.json') != ''
+        run: |
+          echo "📦 Scanning npm packages for security issues..."
+          guarddog npm verify package.json \
+            --output-format sarif \
+            --exclude-rules potentially_compromised_email_domain \
+            > guarddog-npm.sarif
+        continue-on-error: true
+
+      # Also run a detailed scan with JSON output for the job summary
+      - name: Scan npm packages (JSON output for summary)
+        if: hashFiles('package.json') != ''
+        run: |
+          echo "🔍 Running detailed GuardDog analysis..."
+          guarddog npm verify package.json \
+            --output-format json \
+            > guarddog-results.json
+        continue-on-error: true
+
+      # Display results in job summary
+      - name: Generate job summary
+        if: hashFiles('package.json') != ''
+        run: |
+          echo "## 🛡️ GuardDog Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f guarddog-results.json ] && [ -s guarddog-results.json ]; then
+            RESULT_COUNT=$(jq '. | length' guarddog-results.json)
+            
+            if [ "$RESULT_COUNT" -gt 0 ]; then
+              echo "⚠️ **$RESULT_COUNT security issue(s) detected**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Rule | Package | Severity | Description |" >> $GITHUB_STEP_SUMMARY
+              echo "|------|---------|----------|-------------|" >> $GITHUB_STEP_SUMMARY
+              
+              jq -r '.[] | "| `\(.rule)` | \(.package_name // "N/A") | \(.severity // "MEDIUM") | \(.description // .message // "No description") |"' guarddog-results.json >> $GITHUB_STEP_SUMMARY
+              
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "📋 **Summary by rule type:**" >> $GITHUB_STEP_SUMMARY
+              jq -r 'group_by(.rule) | .[] | "- **\(.[0].rule)**: \(length) occurrence(s)"' guarddog-results.json >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ **No security issues detected!**" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "All npm packages passed GuardDog security checks." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "ℹ️ **GuardDog scan completed**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No security issues found in the dependency analysis." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "🔍 **Scan details:**" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tool**: GuardDog v$(guarddog --version 2>/dev/null || echo 'latest')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+      # Upload SARIF results to GitHub Security tab
+      - name: Upload SARIF file to GitHub
+        if: hashFiles('guarddog-npm.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          category: guarddog-npm
+          sarif_file: guarddog-npm.sarif
+
+      # Optional: Fail the build if critical issues are found
+      - name: Check for critical security issues
+        if: hashFiles('package.json') != ''
+        run: |
+          if [ -f guarddog-results.json ] && [ -s guarddog-results.json ]; then
+            # Define critical rules that should fail the build
+            CRITICAL_RULES="npm-exec-base64,npm-exfiltrate-sensitive-data,npm-silent-process-execution"
+            
+            # Check if any critical issues exist
+            CRITICAL_COUNT=$(jq --arg rules "$CRITICAL_RULES" '
+              [.[] | select(.rule as $r | ($rules | split(",") | index($r)))] | length
+            ' guarddog-results.json)
+            
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "❌ Found $CRITICAL_COUNT critical security issue(s)!"
+              echo "The following critical rules were triggered:"
+              jq --arg rules "$CRITICAL_RULES" -r '
+                [.[] | select(.rule as $r | ($rules | split(",") | index($r)))] | 
+                .[] | "- \(.rule): \(.message // .description // "No description")"
+              ' guarddog-results.json
+              echo ""
+              echo "Build failed due to critical security issues."
+              exit 1
+            else
+              echo "✅ No critical security issues found."
+            fi
+          fi
+
+      # Upload scan artifacts for debugging
+      - name: Upload GuardDog results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guarddog-scan-results
+          path: |
+            guarddog-*.sarif
+            guarddog-results.json
+          retention-days: 30
